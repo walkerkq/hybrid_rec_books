@@ -1,0 +1,288 @@
+---
+title: "Recommending"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(openlibraryR)
+library(scales)
+library(factoextra)
+library(gridExtra)
+```
+
+### Approaches  
+
+Resources  
+- https://medium.com/@cfpinela/recommender-systems-user-based-and-item-based-collaborative-filtering-5d5f375a127f  
+
+MY APPROACH  
+- Compute correlation between products based on what's purchased together  
+- Sort by strongest correlations   
+- Identify customers not purchasing both  
+- Estimate value of opportunity  
+  
+OTHER APPROACHES
+- Market basket  
+  - At transaction level, so not appropriate for this purpose.   
+  - Understand the chance that someone buys milk if they have butter in their cart.  
+  - Association rules:  
+    - Support: P(milk + butter)  
+    - Confidence: support/P(butter)  
+    - Lift: confidence/P(milk)  
+- User-based collaborative filtering  
+  - Find K nearest neighbors to user  
+  - Predict how they would rate items their nearest neighbors rated  
+- Item-based collaborative filtering  
+  - Compute cosine/correlation-based/1-jaccard similarity for the items  
+  - Predict the user's "rating" for each item (weighted sum/regression)  
+- SVD  
+
+### Data 
+
+- https://www.kaggle.com/ruchi798/bookcrossing-dataset
+
+```{r load-data}
+#https://www.kaggle.com/ruchi798/bookcrossing-dataset
+books <- read.csv('data/BX_Books.csv', header = TRUE, sep = ';') %>%
+  rename_all(function(x) tolower(gsub('\\.', '_', x))) %>%
+  select(-starts_with('image'))
+
+users <- read.csv('data/BX-Users.csv', header = TRUE, sep = ';') %>%
+  rename_all(function(x) tolower(gsub('\\.', '_', x))) %>%
+  mutate(user_id = as.numeric(user_id))
+
+ratings <- read.csv('data/BX-Book-Ratings.csv', header = TRUE, sep = ';') %>%
+  rename_all(function(x) tolower(gsub('\\.', '_', x)))
+
+# restrict to users that have rated at least 5 books
+active_users <- ratings %>%
+  mutate(book_rating_group = cut(book_rating, 
+                                 breaks = c(-Inf, 0, 3, 6, 9, Inf), 
+                                 labels = c('rating_missing', 'rating_1_3', 'rating_4_6', 'rating_7_9', 'rating_10'))) %>%
+  group_by(user_id) %>%
+  mutate(rating_count = n_distinct(isbn)) %>%
+  ungroup() %>%
+  group_by(user_id, rating_count, book_rating_group) %>%
+  summarise(count = n_distinct(isbn), .groups = 'drop') %>%
+  mutate(pct = count/rating_count) %>%
+  pivot_wider(id_cols = c('user_id', 'rating_count'),
+              names_from = 'book_rating_group',
+              values_from = 'pct') %>%
+  filter(rating_count >= 5) %>%
+  mutate_all(replace_na, 0)
+
+# restrict to books that have been rated by at least 30 users
+books_to_query <- ratings %>%
+  group_by(isbn) %>%
+  summarise(users = n_distinct(user_id),
+            .groups = 'drop') %>%
+  filter(users >= 30) %>%
+  left_join(books, by = c('isbn')) %>%
+  mutate(isbn9 = substr(isbn, 1, 9)) %>%
+  arrange(desc(users))
+
+# 
+# book_details1 <- openlibraryR::get_books(book_id = books_to_query$isbn[1:200])
+# book_details2 <- openlibraryR::get_books(book_id = books_to_query$isbn[201:400])
+# book_details3 <- openlibraryR::get_books(book_id = books_to_query$isbn[401:500])
+# 
+# book_details <- book_details1 %>%
+#   bind_rows(book_details2, book_details3) 
+# 
+# book_details_full <- book_details %>%
+#   unnest(identifiers) %>%
+#   #select(isbn_10, title, authors, number_of_pages) %>%
+#   left_join(books_to_query, by = c('isbn_10' = 'isbn')) %>%
+#   filter(!is.na(users))
+# 
+# saveRDS(book_details_full, 'book_details.rds')
+
+book_details <- readRDS('book_details.rds')
+```
+
+### Cluster users 
+
+```{r}
+# create wide book dataframe  
+
+
+# book subjects  
+book_details_subjects <- book_details %>%
+  unnest(subjects, names_sep = '_', names_repair = 'unique') %>% 
+  mutate(subjects_name = tolower(gsub(" |\\,|\\-", "_", subjects_name)))
+
+subjects <- book_details_subjects %>%
+  group_by(subjects_name) %>%
+  summarise(books = n_distinct(isbn_10),
+            .groups = 'drop') %>%
+  arrange(desc(books)) %>%
+  filter(books > 30)
+
+book_subjects_wide <- book_details_subjects %>% 
+  mutate(subjects_name = ifelse(subjects_name %in% subjects$subjects_name, subjects_name, 'other')) %>%
+  count(isbn_10, subjects_name) %>% 
+  pivot_wider(id_cols = 'isbn_10', names_from = 'subjects_name', names_prefix = 'subject_', values_from = 'n') 
+
+# subject times  
+book_details_times <- book_details %>%
+  unnest(subject_times, names_sep = '_', names_repair = 'unique') %>% 
+  mutate(subject_times_name = gsub("[A-z]| |\\-|\\,", "", subject_times_name),
+         subject_times_name = ifelse(subject_times_name == '' |is.na(subject_times_name), NA, paste0(substr(subject_times_name, 1, 2), "00"))) 
+
+subject_times <- book_details_times %>%
+  group_by(subject_times_name) %>%
+  summarise(books = n_distinct(isbn_10),
+            .groups = 'drop') %>%
+  filter(books > 10)
+
+book_times_wide <- book_details_times %>%
+  mutate(subject_times_name = ifelse(subject_times_name %in% subject_times$subject_times_name, subject_times_name, 'other')) %>%
+  count(isbn_10, subject_times_name) %>% 
+  pivot_wider(id_cols = 'isbn_10', names_from = 'subject_times_name', names_prefix = 'time_', values_from = 'n') 
+
+# dewey 
+book_dewey_wide <- book_details %>%
+  unnest(c('classifications'), names_sep = '_') %>%
+  mutate(dewey = as.numeric(substr(classifications_dewey_decimal_class, 1, 3))) %>%
+  group_by(isbn_10) %>%
+  summarise(dewey = ifelse(all(is.na(dewey)), NA, max(dewey, na.rm = TRUE)),
+            .groups = 'drop') %>%
+  count(isbn_10, dewey) %>%
+  pivot_wider(id_cols = 'isbn_10', names_from = 'dewey', names_prefix = 'dewey_', values_from = 'n')
+
+book_details_matrix <- book_details %>%
+  select(isbn_10, title, number_of_pages) %>%
+  #left_join(book_dewey_wide, by = 'isbn_10') %>%
+  left_join(book_times_wide, by = 'isbn_10') %>%
+  left_join(book_subjects_wide, by = 'isbn_10') %>%
+  mutate_at(vars(starts_with('time'), starts_with('subject'), starts_with('dewey')), function(x) case_when(x >= 1 ~ 1, is.na(x) ~ 0)) 
+
+```
+
+```{r}
+ratings_w_details <- ratings %>%
+  filter(user_id %in% active_users$user_id) %>%
+  left_join(book_details_matrix, by = c('isbn' = 'isbn_10'))
+
+user_details <- users %>%
+  mutate(country = sapply(location, function(x) strsplit(x, ', ')[[1]][3]),
+         age = as.numeric(age))
+  
+user_countries <- user_details %>%
+  group_by(country) %>%
+  summarise(users = n_distinct(user_id), .groups = 'drop') %>%
+  filter(users > 5000)
+
+user_details_wide <- user_details %>%
+  mutate(country = ifelse(country %in% user_countries$country, country, 'other')) %>%
+  count(user_id, age, country) %>%
+  pivot_wider(id_cols = c('user_id', 'age'), names_from = 'country', values_from = 'n', names_prefix = 'country_')
+
+user_qual <- ratings_w_details %>%
+  group_by(user_id) %>%
+  summarise_if(is.numeric, mean, na.rm = TRUE) %>%
+  ungroup() %>%
+  left_join(active_users, by = c('user_id')) %>%
+  left_join(user_details_wide, by = c('user_id')) %>%
+  mutate_if(is.numeric, replace_na, 0)
+
+user_qual_numeric <- user_qual %>%
+  select(-user_id) %>% 
+  mutate_if(is.numeric, scale) %>%
+  #mutate_at(c('age', 'ratings', 'book_rating', 'number_of_pages'), scale) %>%
+  select(-starts_with('country_'), -age)
+
+```
+
+
+```{r kmeans}
+factoextra::fviz_nbclust(sample_n(user_qual_numeric, 1000), kmeans, method = "wss") #20000
+
+book_kmeans <- kmeans(user_qual_numeric, centers = 3, nstart = 25)
+
+factoextra::fviz_cluster(book_kmeans, 
+             data         = user_qual_numeric,
+             ellipse.type = "convex",
+             geom         = 'point',
+             show.clust.cent = TRUE,
+             )
+```
+
+
+```{r}
+user_clusters <- user_qual %>%
+  mutate(cluster = book_kmeans$cluster)
+
+user_clusters %>%
+  group_by(cluster) %>%
+  summarise(count_users = n_distinct(user_id),
+            ratings     = sum(rating_count), 
+            .groups = 'drop') %>%
+  mutate(pct_users = percent(count_users/sum(count_users)),
+         pct_ratings = percent(ratings/sum(ratings))) %>%
+  arrange(desc(count_users))
+
+```
+
+
+```{r fig.width = 12, fig.height = 5}
+user_pca <- prcomp(user_qual_numeric)
+
+scree <- factoextra::fviz_eig(user_pca)
+
+user_eigenvectors <- user_pca$rotation[,1:2] %>%
+  as.data.frame() %>%
+  mutate(feature = row.names(user_pca$rotation)) %>%
+  rename_all(.funs = list(function(x) gsub('V', 'PC', x)))
+
+pca_loadings <- user_eigenvectors %>%
+  pivot_longer(cols = starts_with('PC')) %>%
+  ggplot(aes(y = reorder(feature, value, function(x) abs(mean(x))), x = value)) + 
+  geom_col(position = 'dodge') +
+  facet_wrap(~name, nrow = 1) +
+  labs(title = 'Principal Component Loadings', 
+       x = 'value', y = '')
+
+grid.arrange(scree, pca_loadings, ncol = 2, widths = c(1,3))
+
+```
+
+```{r fig.width = 12, fig.height = 8}
+u1 <- user_clusters %>%
+  select(-rating_count) %>%
+  group_by(cluster) %>%
+  summarise_if(is.numeric, mean) %>%
+  pivot_longer(cols = c(starts_with('time'), starts_with('subject'), starts_with('rating_'))) %>%
+  ggplot(aes(y = name, x = value)) + 
+  geom_col() +
+  geom_text(aes(label = round(value,1)), cex = 2.75, hjust = -0.1) +
+  facet_grid(~cluster, scales = 'free_y') +
+  labs(title = 'Median values by cluster assignment',
+       subtitle = '0: never true, 1: always true',
+       x = 'median value',
+       y = 'feature')
+
+
+u2 <- user_clusters %>%
+  group_by(cluster) %>%
+  summarise_if(is.numeric, mean) %>%
+  pivot_longer(cols = c('book_rating', 'rating_count')) %>%
+  ggplot(aes(y = name, x = value)) + 
+  geom_col() +
+  geom_text(aes(label = round(value,1)), cex = 2.75, hjust = -0.1) +
+  facet_grid(~cluster, scales = 'free_y') +
+  labs(title = 'Median values by cluster assignment',
+       x = 'median value',
+       y = 'feature')
+
+grid.arrange(u1, u2, ncol = 1, heights = c(2,1))
+```
+
+
+- Cluster 1:  Users who have purchased a lot of books, particularly fiction, large type, and "other" subject books.  
+- Cluster 2:  Users who have purchased the least amount of books, especially books that we are missing information about.   
+- Cluster 3:  Users who have the second lowest purchase count, but tend to rate a little higher. They read "reading level" subject matter, literature, and books set in the 2000s, more than other users.  
+
+
